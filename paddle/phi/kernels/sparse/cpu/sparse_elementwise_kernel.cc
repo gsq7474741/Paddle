@@ -26,17 +26,18 @@ limitations under the License. */
 namespace phi {
 namespace sparse {
 
-template <typename T, typename Functor>
+template <typename T, typename OutType, typename Functor>
 struct BinaryOPWithZeroCompareFunctor {
   explicit BinaryOPWithZeroCompareFunctor(Functor functor)
       : functor_(functor) {}
   inline HOSTDEVICE bool operator()(const T* a,
                                     const T* b,
-                                    T* result,
+                                    OutType* result,
                                     const int64_t len) const {
     bool is_zero = true;
     for (int64_t i = 0; i < len; ++i) {
-      result[i] = functor_(a[i], b[i]);
+      result[i] =
+          functor_(static_cast<OutType>(a[i]), static_cast<OutType>(b[i]));
       if (result[i] != 0) {
         is_zero = false;
       }
@@ -46,7 +47,7 @@ struct BinaryOPWithZeroCompareFunctor {
   Functor functor_;
 };
 
-template <typename T, typename IntT, typename Functor>
+template <typename T, typename IntT, typename OutType = T, typename Functor>
 void Merge(const IntT el_len,
            const IntT* a_index,
            const T* a_values,
@@ -56,7 +57,7 @@ void Merge(const IntT el_len,
            const IntT len_b,
            const IntT len_b_max,
            IntT* c_index,
-           T* c_values,
+           OutType* c_values,
            IntT& nnz,
            const Functor& functor_org,
            const bool is_divide) {
@@ -66,7 +67,8 @@ void Merge(const IntT el_len,
   const IntT* b_index = nullptr;
   std::vector<IntT> b_full_index;
   const std::vector<T> zero(el_len, 0);
-  auto functor = BinaryOPWithZeroCompareFunctor<T, Functor>(functor_org);
+  auto functor =
+      BinaryOPWithZeroCompareFunctor<T, OutType, Functor>(functor_org);
 
   std::vector<const T*> b_values(len_b_max, zero.data());
   for (auto i = 0; i < len_b; ++i) {
@@ -167,6 +169,8 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
   const auto y_values = y.non_zero_elements().data<T>();
   const auto sparse_dim = x.non_zero_indices().dims()[0];
   const bool is_divide = std::is_same<Functor, funcs::DivideFunctor<T>>::value;
+  using OutType = typename std::
+      conditional<is_divide && std::is_integral<T>::value, float, T>::type;
 
   int64_t max_len = 1;
   for (auto j = 0; j < sparse_dim; ++j) {
@@ -196,7 +200,7 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
                                      y_indexs.data());
 
   std::vector<IntT> out_indexs;
-  std::vector<T> out_values_vec;
+  std::vector<OutType> out_values_vec;
   if (is_divide) {
     out_indexs.reserve(max_len);
   } else {
@@ -205,19 +209,19 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
   out_values_vec.reserve(max_len * element_size);
 
   //  merge x and y
-  Merge<T, IntT, Functor>(element_size,
-                          x_indexs.data(),
-                          x_values,
-                          x_indexs.size(),
-                          y_indexs.data(),
-                          y_values,
-                          y_indexs.size(),
-                          max_len,
-                          out_indexs.data(),
-                          out_values_vec.data(),
-                          nnz,
-                          functor,
-                          is_divide);
+  Merge<T, IntT, OutType, Functor>(element_size,
+                                   x_indexs.data(),
+                                   x_values,
+                                   x_indexs.size(),
+                                   y_indexs.data(),
+                                   y_values,
+                                   y_indexs.size(),
+                                   max_len,
+                                   out_indexs.data(),
+                                   out_values_vec.data(),
+                                   nnz,
+                                   functor,
+                                   is_divide);
 
   std::vector<IntT> out_indices_vec;
   out_indices_vec.resize(nnz * sparse_dim);
@@ -251,7 +255,7 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
         x.non_zero_elements().dims(), 1, x.non_zero_elements().dims().size()));
     indeces_dim.insert(indeces_dim.begin(), nnz);
     DenseTensorMeta values_meta(
-        paddle::experimental::CppTypeToDataType<T>::Type(),
+        paddle::experimental::CppTypeToDataType<OutType>::Type(),
         phi::make_ddim(indeces_dim),
         DataLayout::NCHW);
     phi::DenseTensor out_indices = phi::Empty(dev_ctx, std::move(indices_meta));
@@ -260,9 +264,9 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
     std::memcpy(out_indices.data<IntT>(),
                 out_indices_vec.data(),
                 sizeof(IntT) * sparse_dim * nnz);
-    std::memcpy(out_values.data<T>(),
+    std::memcpy(out_values.data<OutType>(),
                 out_values_vec.data(),
-                sizeof(T) * nnz * element_size);
+                sizeof(OutType) * nnz * element_size);
 
     out->SetMember(out_indices, out_values, x.dims());
   }
@@ -326,7 +330,25 @@ void ElementWiseCooKernelImpl(const Context& dev_ctx,
 DEFINE_CSR_ELEMENTWISE_CPU_KERNEL(Add)
 DEFINE_CSR_ELEMENTWISE_CPU_KERNEL(Subtract)
 DEFINE_CSR_ELEMENTWISE_CPU_KERNEL(Multiply)
-DEFINE_CSR_ELEMENTWISE_CPU_KERNEL(Divide)
+template <typename T, typename IntT, typename Context>
+void ElementWiseDivideCsrCPUKernel(const Context& dev_ctx,
+                                   const SparseCsrTensor& x,
+                                   const SparseCsrTensor& y,
+                                   SparseCsrTensor* out) {
+  funcs::DivideFunctor<T> functor;
+  auto coo_x = SparseCsrToCoo<T>(dev_ctx, x);
+  auto coo_y = SparseCsrToCoo<T>(dev_ctx, y);
+  DenseTensor indeces;
+  DenseTensor values;
+  SparseCooTensor coo_out;
+  coo_out.SetMember(indeces, values, x.dims());
+  ElementWiseCooKernelImpl<T, IntT, Context, funcs::DivideFunctor<T>>(
+      dev_ctx, coo_x, coo_y, &coo_out, functor);
+  PD_VISIT_ALL_TYPES(coo_out.dtype(), "SparseCooToCsrKernel", ([&] {
+                       SparseCooToCsrKernel<data_t>(dev_ctx, coo_out, out);
+                     }));
+  //  *out = SparseCooToCsr<T>(dev_ctx, coo_out);
+}
 
 DEFINE_CSR_ELEMENTWISE_KERNEL(Add)
 DEFINE_CSR_ELEMENTWISE_KERNEL(Subtract)

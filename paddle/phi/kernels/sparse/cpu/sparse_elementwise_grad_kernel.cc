@@ -18,6 +18,7 @@ limitations under the License. */
 #include "paddle/phi/core/tensor_meta.h"
 #include "paddle/phi/core/visit_type.h"
 #include "paddle/phi/kernels/activation_kernel.h"
+#include "paddle/phi/kernels/copy_kernel.h"
 #include "paddle/phi/kernels/elementwise_kernel.h"
 #include "paddle/phi/kernels/funcs/eigen/common.h"
 #include "paddle/phi/kernels/sparse/copy_kernel.h"
@@ -206,10 +207,31 @@ void ElementWiseDivideCooGradCPUKernel(const Context& dev_ctx,
                                        const SparseCooTensor& dout,
                                        SparseCooTensor* dx,
                                        SparseCooTensor* dy) {
+  SparseCooTensor y_floating;
+  DenseTensorMeta y_values_floting_meta(y.non_zero_elements().meta());
+  DenseTensorMeta y_indices_floting_meta(y.non_zero_indices().meta());
+  y_values_floting_meta.dtype = DataType::FLOAT32;
+  DenseTensor y_values_floting =
+      phi::Empty(dev_ctx, std::move(y_values_floting_meta));
+  DenseTensor y_indices_floting =
+      phi::Empty(dev_ctx, std::move(y_indices_floting_meta));
+  phi::Copy(dev_ctx,
+            y.non_zero_indices(),
+            dev_ctx.GetPlace(),
+            false,
+            &y_indices_floting);
+  const auto y_nze_floting_ptr = y_values_floting.template data<float>();
+  const auto y_nze_ptr = y.non_zero_elements().data<T>();
+  for (int i = 0; i < y.non_zero_elements().numel(); ++i) {
+    y_nze_floting_ptr[i] = static_cast<float>(y_nze_ptr[i]);
+  }
+
+  y_floating.SetMember(y_indices_floting, y_values_floting, y_floating.dims());
   if (dx) {
     //    dout/y
-    AllocCooPtr<T, IntT>(dev_ctx, x, dx);
-    sparse::ElementWiseDivideCooKernel<T, Context>(dev_ctx, dout, y, dx);
+    AllocCooPtr<T, IntT>(dev_ctx, out, dx);
+    sparse::ElementWiseDivideCooKernel<T, Context>(
+        dev_ctx, dout, y_floating, dx);
   }
 
   if (dy) {
